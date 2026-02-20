@@ -588,24 +588,52 @@ export class Wallet {
     const bumps = beef.bumps || []
     console.log(`[Wallet] BEEF contains ${bumps.length} BUMP(s) for merkle proof verification`)
     
-    // Verify each BUMP against ChainTracker
+    // Verify each BUMP against block headers
     let allBumpsVerified = true
     for (const bump of bumps) {
       try {
-        // Extract height and merkle root from BUMP
         const height = bump.blockHeight
         if (height !== undefined && height > 0) {
-          // Calculate merkle root from BUMP
-          const merkleRoot = this.calculateMerkleRootFromBump(bump)
-          
-          // Verify against ChainTracker
-          const isValid = await this.chainTracker.isValidRootForHeight(merkleRoot, height)
-          
-          if (!isValid) {
-            console.warn(`[Wallet] BUMP verification failed for height ${height}: merkle root mismatch`)
+          // Find a txid that uses this BUMP to compute the merkle root
+          let rootVerified = false
+          for (const beefTxEntry of beef.txs) {
+            if (beefTxEntry.hasProof && beefTxEntry.rawTx) {
+              try {
+                const entryTx = Transaction.fromBinary(beefTxEntry.rawTx)
+                const entryTxid = entryTx.id('hex')
+                const computedRoot = bump.computeRoot(entryTxid)
+                if (computedRoot) {
+                  // Try ChainTracker first
+                  let isValid = false
+                  try {
+                    isValid = await this.chainTracker.isValidRootForHeight(computedRoot, height)
+                  } catch {}
+                  
+                  // Fallback: verify against WhatsOnChain block header
+                  if (!isValid) {
+                    try {
+                      const wocResp = await fetch(`https://api.whatsonchain.com/v1/bsv/main/block/${height}/header`)
+                      if (wocResp.ok) {
+                        const blockHeader = await wocResp.json()
+                        isValid = blockHeader.merkleroot === computedRoot
+                      }
+                    } catch {}
+                  }
+                  
+                  if (isValid) {
+                    console.log(`[Wallet] BUMP verified for height ${height} via tx ${entryTxid.substring(0, 16)}...`)
+                    rootVerified = true
+                    break
+                  }
+                }
+              } catch {
+                // This tx might not be in this BUMP, try next
+              }
+            }
+          }
+          if (!rootVerified) {
+            console.warn(`[Wallet] BUMP verification failed for height ${height}: could not verify merkle root`)
             allBumpsVerified = false
-          } else {
-            console.log(`[Wallet] BUMP verified for height ${height}`)
           }
         }
       } catch (err: any) {
@@ -652,7 +680,7 @@ export class Wallet {
       }
       
       // Now verify the transaction (validates all scripts)
-      const scriptVerificationResult = tx.verify()
+      const scriptVerificationResult = await tx.verify()
       if (!scriptVerificationResult) {
         throw new Error('Script evaluation failed: unlocking scripts do not validate')
       }
@@ -886,23 +914,7 @@ export class Wallet {
    * @param bump - BUMP object from BEEF
    * @returns Merkle root as hex string
    */
-  private calculateMerkleRootFromBump(bump: any): string {
-    // The @bsv/sdk Beef.BUMP structure should contain the merkle root
-    // If the BUMP has a root property, use it directly
-    if (bump.root) {
-      return typeof bump.root === 'string' ? bump.root : Buffer.from(bump.root).toString('hex')
-    }
-    
-    // If the BUMP has a path property, calculate the root from the path
-    if (bump.path && bump.txid) {
-      // This is a simplified implementation
-      // Full implementation would iterate through the path and hash pairwise
-      // For now, we attempt to extract the root from the BUMP structure
-      console.warn('[Wallet] BUMP merkle root calculation from path not fully implemented')
-    }
-    
-    throw new Error('Could not extract merkle root from BUMP')
-  }
+  // calculateMerkleRootFromBump removed — using MerklePath.computeRoot() directly in receiveBeef()
   
   /**
    * Store a transaction with optional SPV proof
