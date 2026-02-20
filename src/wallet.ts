@@ -445,106 +445,111 @@ export class Wallet {
     // Broadcast raw transaction
     const txid = (await broadcastTransaction(tx.toHex())).trim()
     
-    // Build BEEF envelope with source transactions and merkle proofs
+    // Build BEEF envelope with full ancestor chain back to proven txs
     const beef = new Beef()
+    const addedTxids = new Set<string>()
     
-    // Add source transactions and their merkle proofs to BEEF
+    // Helper: convert TSC proof to @bsv/sdk MerklePath
+    const tscToMerklePath = async (tscProof: any[], bh: number | null, txid: string): Promise<any> => {
+      const tsc = tscProof[0]
+      if (!tsc?.nodes) return null
+      const { MerklePath: MP } = await import('@bsv/sdk')
+      
+      let height = bh
+      if (!height && tsc.target) {
+        try {
+          const hdr = await fetch(`https://api.whatsonchain.com/v1/bsv/main/block/${tsc.target}/header`)
+          if (hdr.ok) {
+            const h = await hdr.json()
+            height = h.height
+            this.db.prepare('UPDATE transactions SET block_height = ? WHERE txid = ?').run(height, txid)
+          }
+        } catch {}
+      }
+      if (!height) return null
+      
+      const path: any[][] = []
+      let idx = tsc.index
+      for (let level = 0; level < tsc.nodes.length; level++) {
+        const node = tsc.nodes[level]
+        const siblingOffset = idx ^ 1
+        const entries: any[] = []
+        if (level === 0) entries.push({ offset: idx, txid: true })
+        if (node === '*') {
+          entries.push({ offset: siblingOffset, duplicate: true })
+        } else {
+          entries.push({ offset: siblingOffset, hash: node })
+        }
+        path.push(entries)
+        idx = idx >> 1
+      }
+      return new MP(height, path)
+    }
+    
+    // Recursive: add tx and its ancestors to BEEF until we hit a proven tx
+    const addTxChain = async (txid: string, depth: number): Promise<void> => {
+      if (depth > 10 || addedTxids.has(txid)) return
+      addedTxids.add(txid)
+      
+      // Load or fetch raw tx
+      let txRow = this.db.prepare(
+        'SELECT raw_tx, merkle_path, block_height FROM transactions WHERE txid = ?'
+      ).get(txid) as { raw_tx: Buffer; merkle_path: string | null; block_height: number | null } | undefined
+      
+      if (!txRow?.raw_tx) {
+        try {
+          const rawHex = await getRawTx(txid)
+          const rawBuf = Buffer.from(rawHex.trim(), 'hex')
+          this.db.prepare('INSERT OR IGNORE INTO transactions (txid, raw_tx, status, created_at) VALUES (?, ?, ?, ?)')
+            .run(txid, rawBuf, 'unproven', Date.now())
+          txRow = { raw_tx: rawBuf, merkle_path: null, block_height: null }
+        } catch (err: any) {
+          console.warn(`[Wallet] Could not fetch tx ${txid}: ${err.message}`)
+          return
+        }
+      }
+      
+      // Try to get merkle proof if we don't have one
+      let { merkle_path: mp, block_height: bh } = txRow
+      if (!mp) {
+        try {
+          const proof = await fetchMerkleProof(txid)
+          if (proof && Array.isArray(proof) && proof.length > 0) {
+            mp = JSON.stringify(proof)
+            this.db.prepare('UPDATE transactions SET merkle_path = ?, status = ?, proven_at = ? WHERE txid = ?')
+              .run(mp, 'proven', Date.now(), txid)
+          }
+        } catch {}
+      }
+      
+      const sourceTx = Transaction.fromBinary(Array.from(txRow.raw_tx))
+      
+      if (mp) {
+        // Has proof — attach MerklePath and stop recursing
+        try {
+          const merklePath = await tscToMerklePath(JSON.parse(mp), bh, txid)
+          if (merklePath) {
+            sourceTx.merklePath = merklePath
+            console.log(`[Wallet] BEEF: ${txid.substring(0, 16)}... PROVEN`)
+          }
+        } catch {}
+      } else {
+        // No proof — walk to parent tx
+        console.log(`[Wallet] BEEF: ${txid.substring(0, 16)}... unproven, walking ancestors`)
+        const raw = Buffer.from(txRow.raw_tx).toString('hex')
+        const parentTxid = raw.substring(10, 74).match(/../g)!.reverse().join('')
+        await addTxChain(parentTxid, depth + 1)
+      }
+      
+      beef.mergeTransaction(sourceTx)
+    }
+    
+    // Add ancestor chains for each input UTXO
     for (const utxo of selected) {
       try {
-        // Load source transaction from database or fetch from blockchain
-        let rawTxBuf: Buffer | null = null
-        let merklePath: string | null = null
-        let blockHeight: number | null = null
-        
-        const txRow = this.db.prepare(
-          'SELECT raw_tx, merkle_path, block_height FROM transactions WHERE txid = ?'
-        ).get(utxo.txid) as { raw_tx: Buffer; merkle_path: string | null; block_height: number | null } | undefined
-        
-        if (txRow?.raw_tx) {
-          rawTxBuf = txRow.raw_tx
-          merklePath = txRow.merkle_path
-          blockHeight = txRow.block_height
-        } else {
-          // Fetch from blockchain
-          try {
-            const rawHex = await getRawTx(utxo.txid)
-            rawTxBuf = Buffer.from(rawHex.trim(), 'hex')
-            // Store for future use
-            this.db.prepare(
-              'INSERT OR IGNORE INTO transactions (txid, raw_tx, status, created_at) VALUES (?, ?, ?, ?)'
-            ).run(utxo.txid, rawTxBuf, 'unproven', Date.now())
-            console.log(`[Wallet] Fetched and stored source tx ${utxo.txid}`)
-          } catch (err: any) {
-            console.warn(`[Wallet] Could not fetch source tx ${utxo.txid}: ${err.message}`)
-            continue
-          }
-        }
-        
-        // Add source transaction to BEEF
-        const sourceTx = Transaction.fromBinary(Array.from(rawTxBuf))
-        
-        // Fetch merkle proof if we don't have one
-        if (!merklePath) {
-          try {
-            const proof = await fetchMerkleProof(utxo.txid)
-            if (proof && Array.isArray(proof) && proof.length > 0) {
-              merklePath = JSON.stringify(proof)
-              blockHeight = proof[0]?.blockHeight ?? null
-              // Store merkle proof
-              this.db.prepare(
-                'UPDATE transactions SET merkle_path = ?, block_height = ?, status = ?, proven_at = ? WHERE txid = ?'
-              ).run(merklePath, blockHeight, 'proven', Date.now(), utxo.txid)
-              console.log(`[Wallet] Fetched merkle proof for ${utxo.txid} at height ${blockHeight}`)
-            }
-          } catch (err: any) {
-            console.warn(`[Wallet] Could not fetch merkle proof for ${utxo.txid}: ${err.message}`)
-          }
-        }
-        
-        // Add to BEEF: if we have a merkle proof, convert WoC format to MerklePath
-        if (merklePath && blockHeight) {
-          try {
-            const wocProof = JSON.parse(merklePath)
-            // WoC proof format: [{blockHash, blockHeight, merkleProof: [{hash, pos}...]}]
-            // or TSC format: [{index, txOrId, nodes: [hash|*]}]
-            // @bsv/sdk MerklePath.fromBinary or fromHex can parse standard BUMP
-            // For now, build MerklePath manually from WoC data
-            const { MerklePath } = await import('@bsv/sdk')
-            
-            let mp: InstanceType<typeof MerklePath> | null = null
-            
-            if (Array.isArray(wocProof) && wocProof[0]?.merkleProof) {
-              // WoC format: [{blockHeight, merkleProof: [{hash, pos}...]}]
-              const woc = wocProof[0]
-              const nodes = woc.merkleProof.map((n: any) => ({
-                hash: n.hash === '*' ? undefined : n.hash,
-                txid: n.hash === '*',
-                offset: n.pos
-              }))
-              mp = new MerklePath(woc.blockHeight, nodes)
-            } else if (Array.isArray(wocProof) && wocProof[0]?.nodes) {
-              // TSC format
-              const tsc = wocProof[0]
-              const nodes = tsc.nodes.map((n: any, i: number) => ({
-                hash: n === '*' ? undefined : n,
-                txid: n === '*',
-                offset: i
-              }))
-              mp = new MerklePath(tsc.blockHeight || blockHeight, nodes)
-            }
-            
-            if (mp) {
-              sourceTx.merklePath = mp
-              console.log(`[Wallet] Added merkle proof for ${utxo.txid} to BEEF`)
-            }
-          } catch (err: any) {
-            console.warn(`[Wallet] Could not convert merkle proof for ${utxo.txid}: ${err.message}`)
-          }
-        }
-        
-        beef.mergeTransaction(sourceTx)
+        await addTxChain(utxo.txid, 0)
       } catch (err: any) {
-        console.warn(`[Wallet] Error adding source tx ${utxo.txid} to BEEF:`, err.message)
+        console.warn(`[Wallet] Error building BEEF chain for ${utxo.txid}:`, err.message)
       }
     }
     
