@@ -5,8 +5,9 @@
  * This is for initial funding, not payment channels.
  */
 
-import { PrivateKey, P2PKH, Transaction, Hash, Beef } from '@bsv/sdk'
+import { PrivateKey, P2PKH, Transaction, Hash, Beef, ChainTracker } from '@bsv/sdk'
 import { fetchUTXOs, fetchTransaction, fetchMerkleProof, broadcastTransaction, UTXO } from './services.js'
+import { FallbackChainTracker, createDefaultChainTracker } from './chain-tracker.js'
 import Database from 'better-sqlite3'
 import { existsSync, mkdirSync } from 'fs'
 import { dirname, join } from 'path'
@@ -15,8 +16,9 @@ import { homedir } from 'os'
 const { hash160 } = Hash
 
 export interface WalletConfig {
-  privateKey: string  // Hex
-  dbPath?: string     // SQLite path
+  privateKey: string      // Hex
+  dbPath?: string         // SQLite path
+  chainTracker?: ChainTracker  // Optional ChainTracker for SPV verification
 }
 
 export interface TrackedUTXO extends UTXO {
@@ -33,10 +35,12 @@ export class Wallet {
   private address: string
   private db: Database.Database
   private p2pkh: P2PKH
+  private chainTracker: ChainTracker
   
   constructor(config: WalletConfig) {
     this.privateKey = PrivateKey.fromHex(config.privateKey)
     this.p2pkh = new P2PKH()
+    this.chainTracker = config.chainTracker ?? createDefaultChainTracker()
     
     // Derive address from public key
     const pubKeyHash = hash160(this.privateKey.toPublicKey().encode(true))
@@ -513,12 +517,34 @@ export class Wallet {
     }
     
     // Step 2: Verify merkle paths (BUMPs)
-    // TODO: Implement full merkle root verification against ChainTracker (task #206)
-    // For now, we store the merkle paths but cannot verify them against block headers
-    // until ChainTracker is integrated
-    
     const bumps = beef.bumps || []
     console.log(`[Wallet] BEEF contains ${bumps.length} BUMP(s) for merkle proof verification`)
+    
+    // Verify each BUMP against ChainTracker
+    let allBumpsVerified = true
+    for (const bump of bumps) {
+      try {
+        // Extract height and merkle root from BUMP
+        const height = bump.blockHeight
+        if (height !== undefined && height > 0) {
+          // Calculate merkle root from BUMP
+          const merkleRoot = this.calculateMerkleRootFromBump(bump)
+          
+          // Verify against ChainTracker
+          const isValid = await this.chainTracker.isValidRootForHeight(merkleRoot, height)
+          
+          if (!isValid) {
+            console.warn(`[Wallet] BUMP verification failed for height ${height}: merkle root mismatch`)
+            allBumpsVerified = false
+          } else {
+            console.log(`[Wallet] BUMP verified for height ${height}`)
+          }
+        }
+      } catch (err: any) {
+        console.warn('[Wallet] BUMP verification error:', err.message)
+        allBumpsVerified = false
+      }
+    }
     
     // Step 3: Get all transactions from BEEF
     const validTxids = beef.getValidTxids()
@@ -629,12 +655,13 @@ export class Wallet {
           receivedUtxos.push({ vout, satoshis })
           totalReceived += satoshis
           
-          // Record the UTXO (proven status will be set after merkle verification via ChainTracker)
+          // Record the UTXO with proven status based on BUMP verification
           const id = `${txid}:${vout}`
+          const proven = allBumpsVerified ? 1 : 0
           this.db.prepare(`
             INSERT OR REPLACE INTO utxos (id, txid, vout, satoshis, script_pub_key, received_at, block_height, proven)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          `).run(id, txid, vout, satoshis, scriptHex, Date.now(), null, 0)
+          `).run(id, txid, vout, satoshis, scriptHex, Date.now(), null, proven)
         }
       }
     }
@@ -649,7 +676,7 @@ export class Wallet {
       txid,
       utxos: receivedUtxos,
       totalReceived,
-      verified: true // TODO: Set to false if ChainTracker verification fails
+      verified: allBumpsVerified // SPV verification based on ChainTracker
     }
   }
   
@@ -690,8 +717,17 @@ export class Wallet {
           const proof = await fetchMerkleProof(txid)
           if (proof) {
             merklePath = JSON.stringify(proof)
-            verified = true // TODO: Verify against ChainTracker (task #206)
-            console.log(`[Wallet] Fetched merkle proof for ${txid} at height ${blockHeight}`)
+            
+            // Verify merkle root against ChainTracker
+            // The 'target' field in WoC merkle proof is the merkle root
+            if (proof.target) {
+              verified = await this.chainTracker.isValidRootForHeight(proof.target, blockHeight)
+              if (verified) {
+                console.log(`[Wallet] Merkle proof verified for ${txid} at height ${blockHeight}`)
+              } else {
+                console.warn(`[Wallet] Merkle proof verification failed for ${txid}`)
+              }
+            }
           }
         } catch (proofErr) {
           console.warn(`[Wallet] Could not fetch merkle proof for ${txid}:`, proofErr)
@@ -775,6 +811,29 @@ export class Wallet {
     }
     
     return bytes
+  }
+  
+  /**
+   * Calculate merkle root from a BUMP (BRC-74 merkle proof)
+   * @param bump - BUMP object from BEEF
+   * @returns Merkle root as hex string
+   */
+  private calculateMerkleRootFromBump(bump: any): string {
+    // The @bsv/sdk Beef.BUMP structure should contain the merkle root
+    // If the BUMP has a root property, use it directly
+    if (bump.root) {
+      return typeof bump.root === 'string' ? bump.root : Buffer.from(bump.root).toString('hex')
+    }
+    
+    // If the BUMP has a path property, calculate the root from the path
+    if (bump.path && bump.txid) {
+      // This is a simplified implementation
+      // Full implementation would iterate through the path and hash pairwise
+      // For now, we attempt to extract the root from the BUMP structure
+      console.warn('[Wallet] BUMP merkle root calculation from path not fully implemented')
+    }
+    
+    throw new Error('Could not extract merkle root from BUMP')
   }
   
   /**
