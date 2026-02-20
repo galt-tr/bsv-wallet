@@ -474,7 +474,7 @@ export class Wallet {
         const node = tsc.nodes[level]
         const siblingOffset = idx ^ 1
         const entries: any[] = []
-        if (level === 0) entries.push({ offset: idx, txid: true })
+        if (level === 0) entries.push({ offset: idx, hash: txid, txid: true })
         if (node === '*') {
           entries.push({ offset: siblingOffset, duplicate: true })
         } else {
