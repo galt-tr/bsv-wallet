@@ -82,6 +82,22 @@ export class Wallet {
   }
   
   private initDb(): void {
+    // Run migrations
+    this.runMigrations()
+    
+    // Create tables with current schema
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS transactions (
+        txid TEXT PRIMARY KEY,
+        raw_tx BLOB NOT NULL,
+        merkle_path TEXT,
+        block_height INTEGER,
+        status TEXT DEFAULT 'unproven',
+        created_at INTEGER NOT NULL,
+        proven_at INTEGER
+      )
+    `)
+    
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS utxos (
         id TEXT PRIMARY KEY,
@@ -94,9 +110,60 @@ export class Wallet {
         received_at INTEGER NOT NULL,
         spent INTEGER DEFAULT 0,
         spent_txid TEXT,
+        block_height INTEGER,
+        proven INTEGER DEFAULT 0,
         UNIQUE(txid, vout)
       )
     `)
+  }
+  
+  private runMigrations(): void {
+    // Get current schema version
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS schema_version (
+        version INTEGER PRIMARY KEY,
+        applied_at INTEGER NOT NULL
+      )
+    `)
+    
+    const currentVersion = this.db.prepare(
+      'SELECT version FROM schema_version ORDER BY version DESC LIMIT 1'
+    ).get() as { version: number } | undefined
+    
+    const version = currentVersion?.version ?? 0
+    
+    // Migration 1: Add SPV columns to utxos table
+    if (version < 1) {
+      console.log('[Wallet] Running migration 1: Adding SPV columns to utxos')
+      
+      // Check if columns exist (table might be fresh)
+      const tableInfo = this.db.prepare('PRAGMA table_info(utxos)').all() as any[]
+      const hasBlockHeight = tableInfo.some(col => col.name === 'block_height')
+      const hasProven = tableInfo.some(col => col.name === 'proven')
+      
+      if (tableInfo.length > 0) {
+        // Table exists, add columns if missing
+        if (!hasBlockHeight) {
+          this.db.exec('ALTER TABLE utxos ADD COLUMN block_height INTEGER')
+        }
+        if (!hasProven) {
+          this.db.exec('ALTER TABLE utxos ADD COLUMN proven INTEGER DEFAULT 0')
+        }
+      }
+      
+      // Record migration
+      this.db.prepare(
+        'INSERT INTO schema_version (version, applied_at) VALUES (?, ?)'
+      ).run(1, Date.now())
+    }
+    
+    // Migration 2: Create transactions table (already handled by CREATE IF NOT EXISTS)
+    if (version < 2) {
+      console.log('[Wallet] Running migration 2: Creating transactions table')
+      this.db.prepare(
+        'INSERT INTO schema_version (version, applied_at) VALUES (?, ?)'
+      ).run(2, Date.now())
+    }
   }
   
   /**
@@ -388,5 +455,84 @@ export class Wallet {
     }
     
     return bytes
+  }
+  
+  /**
+   * Store a transaction with optional SPV proof
+   */
+  storeTransaction(txid: string, rawTx: Buffer, merklePath?: string, blockHeight?: number): void {
+    this.db.prepare(`
+      INSERT OR REPLACE INTO transactions (txid, raw_tx, merkle_path, block_height, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      txid,
+      rawTx,
+      merklePath ?? null,
+      blockHeight ?? null,
+      merklePath ? 'proven' : 'unproven',
+      Date.now()
+    )
+  }
+  
+  /**
+   * Update transaction proof status
+   */
+  updateTransactionProof(txid: string, merklePath: string, blockHeight: number): void {
+    this.db.prepare(`
+      UPDATE transactions 
+      SET merkle_path = ?, block_height = ?, status = 'proven', proven_at = ?
+      WHERE txid = ?
+    `).run(merklePath, blockHeight, Date.now(), txid)
+  }
+  
+  /**
+   * Get transaction by txid
+   */
+  getTransaction(txid: string): { txid: string; rawTx: Buffer; merklePath?: string; blockHeight?: number; status: string } | null {
+    const row = this.db.prepare(
+      'SELECT txid, raw_tx, merkle_path, block_height, status FROM transactions WHERE txid = ?'
+    ).get(txid) as any
+    
+    if (!row) return null
+    
+    return {
+      txid: row.txid,
+      rawTx: row.raw_tx,
+      merklePath: row.merkle_path,
+      blockHeight: row.block_height,
+      status: row.status
+    }
+  }
+  
+  /**
+   * Mark UTXO as proven (has valid merkle proof)
+   */
+  markUTXOProven(txid: string, vout: number, blockHeight: number): void {
+    const id = `${txid}:${vout}`
+    this.db.prepare(`
+      UPDATE utxos SET proven = 1, block_height = ? WHERE id = ?
+    `).run(blockHeight, id)
+  }
+  
+  /**
+   * Get proven UTXOs (for SPV compliance)
+   */
+  getProvenUTXOs(): TrackedUTXO[] {
+    const rows = this.db.prepare(
+      'SELECT * FROM utxos WHERE spent = 0 AND proven = 1 ORDER BY satoshis DESC'
+    ).all() as any[]
+    
+    return rows.map(row => ({
+      id: row.id,
+      txid: row.txid,
+      vout: row.vout,
+      satoshis: row.satoshis,
+      scriptPubKey: row.script_pub_key,
+      fromPeerId: row.from_peer_id,
+      memo: row.memo,
+      receivedAt: row.received_at,
+      spent: Boolean(row.spent),
+      spentTxid: row.spent_txid
+    }))
   }
 }
