@@ -98,7 +98,8 @@ export class Wallet {
         block_height INTEGER,
         status TEXT DEFAULT 'unproven',
         created_at INTEGER NOT NULL,
-        proven_at INTEGER
+        proven_at INTEGER,
+        beef TEXT
       )
     `)
     
@@ -445,111 +446,49 @@ export class Wallet {
     // Broadcast raw transaction
     const txid = (await broadcastTransaction(tx.toHex())).trim()
     
-    // Build BEEF envelope with full ancestor chain back to proven txs
+    // Build BEEF envelope
+    // Strategy: get BEEF for each input UTXO (from DB or WoC), merge into one, add new tx
     const beef = new Beef()
-    const addedTxids = new Set<string>()
     
-    // Helper: convert TSC proof to @bsv/sdk MerklePath
-    const tscToMerklePath = async (tscProof: any[], bh: number | null, txid: string): Promise<any> => {
-      const tsc = tscProof[0]
-      if (!tsc?.nodes) return null
-      const { MerklePath: MP } = await import('@bsv/sdk')
-      
-      let height = bh
-      if (!height && tsc.target) {
-        try {
-          const hdr = await fetch(`https://api.whatsonchain.com/v1/bsv/main/block/${tsc.target}/header`)
-          if (hdr.ok) {
-            const h = await hdr.json()
-            height = h.height
-            this.db.prepare('UPDATE transactions SET block_height = ? WHERE txid = ?').run(height, txid)
-          }
-        } catch {}
-      }
-      if (!height) return null
-      
-      const path: any[][] = []
-      let idx = tsc.index
-      for (let level = 0; level < tsc.nodes.length; level++) {
-        const node = tsc.nodes[level]
-        const siblingOffset = idx ^ 1
-        const entries: any[] = []
-        if (level === 0) entries.push({ offset: idx, hash: txid, txid: true })
-        if (node === '*') {
-          entries.push({ offset: siblingOffset, duplicate: true })
-        } else {
-          entries.push({ offset: siblingOffset, hash: node })
-        }
-        path.push(entries)
-        idx = idx >> 1
-      }
-      return new MP(height, path)
-    }
-    
-    // Recursive: add tx and its ancestors to BEEF until we hit a proven tx
-    const addTxChain = async (txid: string, depth: number): Promise<void> => {
-      if (depth > 10 || addedTxids.has(txid)) return
-      addedTxids.add(txid)
-      
-      // Load or fetch raw tx
-      let txRow = this.db.prepare(
-        'SELECT raw_tx, merkle_path, block_height FROM transactions WHERE txid = ?'
-      ).get(txid) as { raw_tx: Buffer; merkle_path: string | null; block_height: number | null } | undefined
-      
-      if (!txRow?.raw_tx) {
-        try {
-          const rawHex = await getRawTx(txid)
-          const rawBuf = Buffer.from(rawHex.trim(), 'hex')
-          this.db.prepare('INSERT OR IGNORE INTO transactions (txid, raw_tx, status, created_at) VALUES (?, ?, ?, ?)')
-            .run(txid, rawBuf, 'unproven', Date.now())
-          txRow = { raw_tx: rawBuf, merkle_path: null, block_height: null }
-        } catch (err: any) {
-          console.warn(`[Wallet] Could not fetch tx ${txid}: ${err.message}`)
-          return
-        }
-      }
-      
-      // Try to get merkle proof if we don't have one
-      let { merkle_path: mp, block_height: bh } = txRow
-      if (!mp) {
-        try {
-          const proof = await fetchMerkleProof(txid)
-          if (proof && Array.isArray(proof) && proof.length > 0) {
-            mp = JSON.stringify(proof)
-            this.db.prepare('UPDATE transactions SET merkle_path = ?, status = ?, proven_at = ? WHERE txid = ?')
-              .run(mp, 'proven', Date.now(), txid)
-          }
-        } catch {}
-      }
-      
-      const sourceTx = Transaction.fromBinary(Array.from(txRow.raw_tx))
-      
-      if (mp) {
-        // Has proof — attach MerklePath and stop recursing
-        try {
-          const merklePath = await tscToMerklePath(JSON.parse(mp), bh, txid)
-          if (merklePath) {
-            sourceTx.merklePath = merklePath
-            console.log(`[Wallet] BEEF: ${txid.substring(0, 16)}... PROVEN`)
-          }
-        } catch {}
-      } else {
-        // No proof — walk to parent tx
-        console.log(`[Wallet] BEEF: ${txid.substring(0, 16)}... unproven, walking ancestors`)
-        const raw = Buffer.from(txRow.raw_tx).toString('hex')
-        const parentTxid = raw.substring(10, 74).match(/../g)!.reverse().join('')
-        await addTxChain(parentTxid, depth + 1)
-      }
-      
-      beef.mergeTransaction(sourceTx)
-    }
-    
-    // Add ancestor chains for each input UTXO
     for (const utxo of selected) {
       try {
-        await addTxChain(utxo.txid, 0)
+        // Check if we have BEEF stored in DB
+        const txRow = this.db.prepare('SELECT beef FROM transactions WHERE txid = ?')
+          .get(utxo.txid) as { beef: string | null } | undefined
+        
+        let inputBeefHex = txRow?.beef
+        
+        // If not stored, fetch from WoC
+        if (!inputBeefHex) {
+          try {
+            const r = await fetch(`https://api.whatsonchain.com/v1/bsv/main/tx/${utxo.txid}/beef`)
+            if (r.ok) {
+              inputBeefHex = (await r.text()).trim()
+              if (inputBeefHex.includes('beef')) {
+                // Store for future use
+                this.db.prepare('UPDATE transactions SET beef = ? WHERE txid = ?').run(inputBeefHex, utxo.txid)
+                console.log(`[Wallet] Fetched and stored BEEF for ${utxo.txid.substring(0, 16)}...`)
+              } else {
+                inputBeefHex = null
+              }
+            }
+          } catch (err: any) {
+            console.warn(`[Wallet] Could not fetch BEEF for ${utxo.txid}: ${err.message}`)
+          }
+        }
+        
+        // Merge input BEEF into our combined BEEF
+        if (inputBeefHex) {
+          try {
+            const inputBeef = Beef.fromString(inputBeefHex)
+            beef.mergeBeef(inputBeef)
+            console.log(`[Wallet] Merged BEEF for input ${utxo.txid.substring(0, 16)}...`)
+          } catch (err: any) {
+            console.warn(`[Wallet] Could not parse BEEF for ${utxo.txid}: ${err.message}`)
+          }
+        }
       } catch (err: any) {
-        console.warn(`[Wallet] Error building BEEF chain for ${utxo.txid}:`, err.message)
+        console.warn(`[Wallet] Error getting BEEF for ${utxo.txid}:`, err.message)
       }
     }
     
@@ -560,8 +499,10 @@ export class Wallet {
     const beefBinary = beef.toBinary()
     const beefHex = beef.toHex()
     
-    // Store the new transaction in transactions table
+    // Store the new transaction in transactions table (with BEEF)
     this.storeTransaction(txid, Buffer.from(tx.toBinary()), undefined, undefined)
+    // Store BEEF for this tx so future spends have it
+    this.db.prepare('UPDATE transactions SET beef = ? WHERE txid = ?').run(beefHex, txid)
     
     // Mark UTXOs as spent
     for (const utxo of selected) {
