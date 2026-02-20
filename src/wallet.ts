@@ -458,6 +458,21 @@ export class Wallet {
         
         let inputBeefHex = txRow?.beef
         
+        // Refresh from WoC if stored BEEF has 0 BUMPs (stale — tx may have confirmed since)
+        if (inputBeefHex && inputBeefHex.substring(8, 10) === '00') {
+          try {
+            const r = await fetch(`https://api.whatsonchain.com/v1/bsv/main/tx/${utxo.txid}/beef`)
+            if (r.ok) {
+              const fresh = (await r.text()).trim()
+              if (fresh.includes('beef') && fresh.substring(8, 10) !== '00') {
+                inputBeefHex = fresh
+                this.db.prepare('UPDATE transactions SET beef = ? WHERE txid = ?').run(fresh, utxo.txid)
+                console.log(`[Wallet] Refreshed BEEF for ${utxo.txid.substring(0, 16)}... (now has BUMPs)`)
+              }
+            }
+          } catch {}
+        }
+        
         // If not stored, fetch from WoC
         if (!inputBeefHex) {
           try {
