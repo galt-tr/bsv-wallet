@@ -47,7 +47,7 @@ async function main() {
           const levelEntries: any[] = []
           // At level 0, mark the tx's own position
           if (level === 0) {
-            levelEntries.push({ offset: idx, txid: true })
+            levelEntries.push({ offset: idx, hash: txid, txid: true })
           }
           // Add the sibling hash
           if (node === '*') {
