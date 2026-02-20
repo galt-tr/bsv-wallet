@@ -119,7 +119,7 @@ export async function broadcastTransaction(txHex: string): Promise<string> {
  * Returns TSC/BUMP format merkle path
  */
 export async function fetchMerkleProof(txid: string): Promise<MerkleProof | null> {
-  const response = await fetch(`${WOC_BASE}/tx/${txid}/proof`)
+  const response = await fetch(`${WOC_BASE}/tx/${txid}/proof/tsc`)
   
   if (!response.ok) {
     // Transaction might not be confirmed yet
