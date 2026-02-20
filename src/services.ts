@@ -130,7 +130,9 @@ export async function fetchMerkleProof(txid: string): Promise<MerkleProof | null
   }
   
   const proof = await response.json()
-  return proof as MerkleProof
+  // WoC /proof/tsc returns an array; take the first entry
+  const entry = Array.isArray(proof) ? proof[0] : proof
+  return entry as MerkleProof
 }
 
 /**

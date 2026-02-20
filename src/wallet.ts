@@ -5,7 +5,7 @@
  * This is for initial funding, not payment channels.
  */
 
-import { PrivateKey, P2PKH, Transaction, Hash, Beef, ChainTracker } from '@bsv/sdk'
+import { PrivateKey, P2PKH, Transaction, Hash, Beef, ChainTracker, MerklePath } from '@bsv/sdk'
 import { fetchUTXOs, fetchTransaction, fetchMerkleProof, broadcastTransaction, getRawTx, UTXO } from './services.js'
 import { FallbackChainTracker, createDefaultChainTracker } from './chain-tracker.js'
 import Database from 'better-sqlite3'
