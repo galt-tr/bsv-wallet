@@ -1,0 +1,38 @@
+{
+  "name": "bsv-wallet",
+  "version": "0.1.0",
+  "description": "Simple BSV wallet for OpenClaw agents. UTXO tracking, balance, send, receive.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "bsv-wallet": "dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src/",
+    "clean": "rm -rf dist/"
+  },
+  "files": [
+    "dist/",
+    "SKILL.md",
+    "extensions/"
+  ],
+  "keywords": ["bsv", "bitcoin", "wallet", "openclaw", "agent"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/galt-tr/bsv-wallet.git"
+  },
+  "dependencies": {
+    "@bsv/sdk": "^2.1.0",
+    "better-sqlite3": "^12.6.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
+  }
+}
