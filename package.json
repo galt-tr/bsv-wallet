@@ -27,7 +27,7 @@
     "url": "https://github.com/galt-tr/bsv-wallet.git"
   },
   "dependencies": {
-    "@bsv/sdk": "^2.1.0",
+    "@bsv/sdk": "^2.0.0",
     "better-sqlite3": "^12.6.0"
   },
   "devDependencies": {
