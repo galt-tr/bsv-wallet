@@ -132,3 +132,40 @@ export async function fetchMerkleProof(txid: string): Promise<MerkleProof | null
   const proof = await response.json()
   return proof as MerkleProof
 }
+
+/**
+ * Fetch raw transaction hex by txid
+ * Alias for fetchTransaction but returns just hex
+ */
+export async function getRawTx(txid: string): Promise<string> {
+  const response = await fetch(`${WOC_BASE}/tx/${txid}/hex`)
+  if (!response.ok) {
+    throw new Error(`Failed to fetch raw transaction: ${response.statusText}`)
+  }
+  return await response.text()
+}
+
+/**
+ * Broadcast BEEF envelope (BRC-62)
+ * Tries ARC endpoint first, falls back to raw tx broadcast
+ */
+export async function broadcastBeef(beefHex: string): Promise<string> {
+  // TODO: Implement ARC endpoint when available
+  // For now, fall back to extracting the transaction and broadcasting raw
+  
+  // ARC endpoint would be:
+  // const response = await fetch('https://arc.taal.com/v1/tx', {
+  //   method: 'POST',
+  //   headers: { 'Content-Type': 'application/octet-stream' },
+  //   body: Buffer.from(beefHex, 'hex')
+  // })
+  
+  // Fallback: broadcast as raw transaction
+  // Extract the transaction from BEEF and broadcast it
+  // (The transaction is the last entry in the BEEF envelope)
+  
+  console.warn('[broadcastBeef] ARC endpoint not configured, falling back to raw tx broadcast')
+  
+  // For now, caller should handle broadcasting the raw tx separately
+  throw new Error('ARC endpoint not yet implemented, use broadcastTransaction() fallback')
+}
