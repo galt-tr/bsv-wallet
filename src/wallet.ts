@@ -5,7 +5,7 @@
  * This is for initial funding, not payment channels.
  */
 
-import { PrivateKey, P2PKH, Transaction, Hash } from '@bsv/sdk'
+import { PrivateKey, P2PKH, Transaction, Hash, Beef } from '@bsv/sdk'
 import { fetchUTXOs, fetchTransaction, broadcastTransaction, UTXO } from './services.js'
 import Database from 'better-sqlite3'
 import { existsSync, mkdirSync } from 'fs'
@@ -187,12 +187,14 @@ export class Wallet {
    * @param toAddress - Recipient's BSV address
    * @param amount - Amount in satoshis
    * @param fee - Transaction fee (default: 200 sats)
-   * @returns Transaction details
+   * @returns Transaction details including BEEF envelope
    */
   async send(toAddress: string, amount: number, fee: number = 200): Promise<{
     txid: string
     vout: number
     change?: number
+    beef: string  // BEEF envelope as hex string
+    beefBinary: number[]  // BEEF envelope as binary array
   }> {
     const utxos = this.getUTXOs()
     
@@ -247,6 +249,12 @@ export class Wallet {
     // Broadcast
     const txid = (await broadcastTransaction(tx.toHex())).trim()
     
+    // Create BEEF envelope
+    const beef = new Beef()
+    beef.mergeTransaction(tx)
+    const beefBinary = beef.toBinary()
+    const beefHex = beef.toHex()
+    
     // Mark UTXOs as spent
     for (const utxo of selected) {
       this.db.prepare(
@@ -264,7 +272,91 @@ export class Wallet {
     return {
       txid,
       vout: 0, // Payment is first output
-      change: change > 546 ? change : undefined
+      change: change > 546 ? change : undefined,
+      beef: beefHex,
+      beefBinary
+    }
+  }
+  
+  /**
+   * Receive and import a BEEF payment
+   * 
+   * @param beefData - BEEF envelope as hex string or binary array
+   * @param expectedTxid - Optional txid to verify
+   * @returns Transaction details of the imported payment
+   */
+  async receiveBeef(beefData: string | number[] | Uint8Array, expectedTxid?: string): Promise<{
+    txid: string
+    utxos: Array<{ vout: number; satoshis: number }>
+    totalReceived: number
+  }> {
+    // Parse BEEF
+    let beef: Beef
+    if (typeof beefData === 'string') {
+      beef = Beef.fromString(beefData, 'hex')
+    } else {
+      beef = Beef.fromBinary(beefData)
+    }
+    
+    // Validate BEEF structure
+    if (!beef.isValid()) {
+      throw new Error('Invalid BEEF structure')
+    }
+    
+    // Get all valid transactions from BEEF
+    const validTxids = beef.getValidTxids()
+    
+    if (validTxids.length === 0) {
+      throw new Error('No valid transactions in BEEF')
+    }
+    
+    // The payment transaction is typically the last (newest) transaction
+    const paymentTxid = expectedTxid || validTxids[validTxids.length - 1]
+    
+    const beefTx = beef.findTxid(paymentTxid)
+    if (!beefTx || !beefTx.rawTx) {
+      throw new Error(`Payment transaction ${paymentTxid} not found in BEEF`)
+    }
+    
+    // Parse the transaction
+    const tx = Transaction.fromBinary(beefTx.rawTx)
+    const txid = tx.id('hex')
+    
+    // Find outputs belonging to this wallet
+    const myPubKeyHash = hash160(this.privateKey.toPublicKey().encode(true))
+    const receivedUtxos: Array<{ vout: number; satoshis: number }> = []
+    let totalReceived = 0
+    
+    for (let vout = 0; vout < tx.outputs.length; vout++) {
+      const output = tx.outputs[vout]
+      const scriptHex = output.lockingScript.toHex()
+      
+      // Check if this output is for us (P2PKH to our address)
+      // P2PKH script: OP_DUP OP_HASH160 <pubkeyhash> OP_EQUALVERIFY OP_CHECKSIG
+      if (scriptHex.startsWith('76a914') && scriptHex.endsWith('88ac')) {
+        const pubKeyHashInScript = scriptHex.slice(6, -4) // Extract pubkeyhash
+        const myPubKeyHashHex = Buffer.from(myPubKeyHash).toString('hex')
+        
+        if (pubKeyHashInScript === myPubKeyHashHex) {
+          // This output is for us!
+          const satoshis = output.satoshis ?? 0
+          receivedUtxos.push({ vout, satoshis })
+          totalReceived += satoshis
+          
+          // Record the UTXO
+          this.recordPayment(txid, vout, satoshis, scriptHex)
+        }
+      }
+    }
+    
+    if (receivedUtxos.length === 0) {
+      throw new Error('No outputs for this wallet found in transaction')
+    }
+    
+    return {
+      txid,
+      utxos: receivedUtxos,
+      totalReceived
     }
   }
   
