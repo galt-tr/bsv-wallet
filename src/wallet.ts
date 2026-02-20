@@ -6,7 +6,7 @@
  */
 
 import { PrivateKey, P2PKH, Transaction, Hash, Beef } from '@bsv/sdk'
-import { fetchUTXOs, fetchTransaction, broadcastTransaction, UTXO } from './services.js'
+import { fetchUTXOs, fetchTransaction, fetchMerkleProof, broadcastTransaction, UTXO } from './services.js'
 import Database from 'better-sqlite3'
 import { existsSync, mkdirSync } from 'fs'
 import { dirname, join } from 'path'
@@ -181,7 +181,17 @@ export class Wallet {
   }
   
   /**
-   * Sync UTXOs from the blockchain
+   * Sync UTXOs from the blockchain with SPV proofs
+   * 
+   * Fetches UTXOs from WoC, then for each:
+   * 1. Fetches raw transaction
+   * 2. Fetches merkle proof (if confirmed)
+   * 3. Stores tx + proof in database
+   * 4. Marks UTXO as proven if proof verified
+   * 
+   * Also attempts to prove any previously unproven UTXOs.
+   * 
+   * @returns Number of new UTXOs discovered
    */
   async sync(): Promise<number> {
     const utxos = await fetchUTXOs(this.address)
@@ -189,20 +199,135 @@ export class Wallet {
     
     for (const utxo of utxos) {
       const existing = this.db.prepare(
-        'SELECT id FROM utxos WHERE txid = ? AND vout = ?'
-      ).get(utxo.txid, utxo.vout)
+        'SELECT id, proven FROM utxos WHERE txid = ? AND vout = ?'
+      ).get(utxo.txid, utxo.vout) as { id: string; proven: number } | undefined
       
       if (!existing) {
+        // New UTXO - fetch tx and proof
         const id = `${utxo.txid}:${utxo.vout}`
+        
+        // Fetch raw transaction
+        let blockHeight: number | undefined
+        let proven = 0
+        
+        try {
+          const txInfo = await fetchTransaction(utxo.txid)
+          const rawTx = Buffer.from(txInfo.hex, 'hex')
+          
+          // Store transaction if not already stored
+          const existingTx = this.db.prepare('SELECT txid FROM transactions WHERE txid = ?').get(utxo.txid)
+          if (!existingTx) {
+            this.db.prepare(`
+              INSERT INTO transactions (txid, raw_tx, block_height, status, created_at)
+              VALUES (?, ?, ?, ?, ?)
+            `).run(utxo.txid, rawTx, txInfo.blockHeight || null, txInfo.blockHeight ? 'confirmed' : 'unproven', Date.now())
+          }
+          
+          // Try to fetch and store merkle proof if confirmed
+          if (txInfo.blockHeight) {
+            blockHeight = txInfo.blockHeight
+            
+            try {
+              const proof = await fetchMerkleProof(utxo.txid)
+              if (proof) {
+                // Store merkle proof
+                this.db.prepare(`
+                  UPDATE transactions
+                  SET merkle_path = ?, status = ?, proven_at = ?
+                  WHERE txid = ?
+                `).run(JSON.stringify(proof), 'proven', Date.now(), utxo.txid)
+                
+                proven = 1
+              }
+            } catch (proofErr) {
+              console.warn(`[Wallet] Failed to fetch proof for ${utxo.txid}:`, proofErr)
+            }
+          }
+        } catch (err) {
+          console.error(`[Wallet] Failed to fetch transaction ${utxo.txid}:`, err)
+        }
+        
+        // Store UTXO
         this.db.prepare(`
-          INSERT INTO utxos (id, txid, vout, satoshis, script_pub_key, received_at)
-          VALUES (?, ?, ?, ?, ?, ?)
-        `).run(id, utxo.txid, utxo.vout, utxo.satoshis, utxo.scriptPubKey, Date.now())
+          INSERT INTO utxos (id, txid, vout, satoshis, script_pub_key, received_at, block_height, proven)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(id, utxo.txid, utxo.vout, utxo.satoshis, utxo.scriptPubKey, Date.now(), blockHeight || null, proven)
+        
         newCount++
+      } else if (existing.proven === 0) {
+        // Existing UTXO that hasn't been proven - try to prove it
+        try {
+          const proof = await fetchMerkleProof(utxo.txid)
+          if (proof) {
+            // Update transaction with proof
+            this.db.prepare(`
+              UPDATE transactions
+              SET merkle_path = ?, status = ?, proven_at = ?
+              WHERE txid = ?
+            `).run(JSON.stringify(proof), 'proven', Date.now(), utxo.txid)
+            
+            // Mark UTXO as proven
+            this.db.prepare(`
+              UPDATE utxos
+              SET proven = 1
+              WHERE txid = ? AND vout = ?
+            `).run(utxo.txid, utxo.vout)
+          }
+        } catch (proofErr) {
+          // Still unproven, skip
+        }
       }
     }
     
     return newCount
+  }
+  
+  /**
+   * Batch-check unproven transactions and fetch merkle proofs
+   * 
+   * Scans all transactions with status='unproven' or status='confirmed',
+   * attempts to fetch merkle proofs, and updates their status.
+   * 
+   * Also updates associated UTXOs to mark them as proven.
+   * 
+   * @returns Number of transactions proven
+   */
+  async proveUnproven(): Promise<number> {
+    // Find all unproven transactions
+    const unprovenTxs = this.db.prepare(`
+      SELECT txid FROM transactions
+      WHERE status IN ('unproven', 'confirmed')
+    `).all() as { txid: string }[]
+    
+    let provenCount = 0
+    
+    for (const { txid } of unprovenTxs) {
+      try {
+        const proof = await fetchMerkleProof(txid)
+        if (proof) {
+          // Update transaction with proof
+          this.db.prepare(`
+            UPDATE transactions
+            SET merkle_path = ?, status = ?, proven_at = ?
+            WHERE txid = ?
+          `).run(JSON.stringify(proof), 'proven', Date.now(), txid)
+          
+          // Mark all UTXOs from this tx as proven
+          this.db.prepare(`
+            UPDATE utxos
+            SET proven = 1
+            WHERE txid = ?
+          `).run(txid)
+          
+          provenCount++
+        }
+      } catch (err) {
+        // Proof not available yet, skip
+        console.warn(`[Wallet] Could not prove ${txid}:`, err)
+      }
+    }
+    
+    return provenCount
   }
   
   /**

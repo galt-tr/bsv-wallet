@@ -27,6 +27,15 @@ export interface TxInfo {
   merkleProof?: any
 }
 
+export interface MerkleProof {
+  index: number
+  txOrId: string
+  target: string
+  nodes: string[]
+  targetType?: string
+  proofType?: string
+}
+
 /**
  * Fetch UTXOs for an address from WhatsOnChain
  */
@@ -103,4 +112,23 @@ export async function broadcastTransaction(txHex: string): Promise<string> {
   
   const txid = await response.text()
   return txid.replace(/"/g, '').trim()
+}
+
+/**
+ * Fetch merkle proof for a transaction
+ * Returns TSC/BUMP format merkle path
+ */
+export async function fetchMerkleProof(txid: string): Promise<MerkleProof | null> {
+  const response = await fetch(`${WOC_BASE}/tx/${txid}/proof`)
+  
+  if (!response.ok) {
+    // Transaction might not be confirmed yet
+    if (response.status === 404) {
+      return null
+    }
+    throw new Error(`Failed to fetch merkle proof: ${response.statusText}`)
+  }
+  
+  const proof = await response.json()
+  return proof as MerkleProof
 }
